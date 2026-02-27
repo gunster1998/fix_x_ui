@@ -13,8 +13,12 @@ import httpx
 import asyncssh
 
 from urllib.parse import urlparse
-from aiogram import Router
+from aiogram import F, Router
+from aiogram.types import CallbackQuery, InlineKeyboardButton
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+from filters.admin import IsAdminFilter
+from handlers.admin.panel.keyboard import AdminPanelCallback
 from hooks.hooks import register_hook
 from logger import logger
 
@@ -228,3 +232,103 @@ async def _on_periodic(bot, session, **kwargs):
 
 
 register_hook("periodic_notifications", _on_periodic)
+
+
+# ── Кнопка в админ-панели ─────────────────────────────────────────────────────
+
+@register_hook("admin_panel")
+def admin_panel_button(admin_role: str = "admin", **kwargs):
+    """Добавляет кнопку 'Проверить VLESS' в админ-панель."""
+    btn = InlineKeyboardButton(
+        text="🔍 Проверить VLESS",
+        callback_data=AdminPanelCallback(action="vless_monitor_check").pack(),
+    )
+    return {"button": btn}
+
+
+@router.callback_query(AdminPanelCallback.filter(F.action == "vless_monitor_check"), IsAdminFilter())
+async def handle_check_now(callback: CallbackQuery):
+    """Ручная проверка VLESS-портов с домашнего сервера."""
+    from .settings import HOME_SSH_HOST, HOME_SSH_PORT, HOME_SSH_USER, HOME_SSH_PASS, CONNECT_TIMEOUT
+    from panels._3xui import get_xui_instance
+    from database import async_session_maker, get_servers
+
+    await callback.answer("Проверяю серверы...", show_alert=False)
+    await callback.message.edit_text("🔍 Проверяю доступность VLESS-портов с домашнего интернета...")
+
+    # Собираем цели
+    targets: dict[str, tuple[str, int]] = {}
+    try:
+        async with async_session_maker() as session:
+            servers_dict = await get_servers(session, include_enabled=True)
+
+        for cluster_id, server_list in servers_dict.items():
+            for server_info in server_list:
+                if server_info.get("panel_type", "3x-ui") != "3x-ui":
+                    continue
+                api_url = server_info.get("api_url")
+                inbound_id = server_info.get("inbound_id")
+                server_name = server_info.get("server_name", "unknown")
+                if not api_url or not inbound_id:
+                    continue
+                try:
+                    xui = await get_xui_instance(api_url)
+                    host = xui.inbound._host
+                    session_cookie = xui._session or xui.inbound._session
+                    port = await _get_inbound_port(host, session_cookie, int(inbound_id))
+                    if port:
+                        vless_host = urlparse(api_url).hostname
+                        targets[server_name] = (vless_host, port)
+                except Exception:
+                    pass
+    except Exception as e:
+        await callback.message.edit_text(f"❌ Ошибка получения серверов: {e}")
+        return
+
+    if not targets:
+        await callback.message.edit_text("❌ Нет серверов для проверки.")
+        return
+
+    # Запускаем проверки
+    results = await _check_from_home(
+        targets=targets,
+        ssh_host=HOME_SSH_HOST,
+        ssh_port=HOME_SSH_PORT,
+        ssh_user=HOME_SSH_USER,
+        ssh_pass=HOME_SSH_PASS,
+        timeout=CONNECT_TIMEOUT,
+    )
+
+    if not results:
+        await callback.message.edit_text(
+            "⚠️ Не удалось подключиться к домашнему серверу для проверки."
+        )
+        return
+
+    # Формируем отчёт
+    lines = []
+    for name in sorted(results.keys()):
+        ok = results[name]
+        host, port = targets.get(name, ("?", "?"))
+        icon = "✅" if ok else "❌"
+        lines.append(f"{icon} <b>{name}</b> — <code>{host}:{port}</code>")
+
+    up = sum(1 for ok in results.values() if ok)
+    down = len(results) - up
+    text = (
+        f"🔍 Проверка VLESS-портов (домашний интернет)\n\n"
+        + "\n".join(lines)
+        + f"\n\n<b>Итого: {up} ✅ / {down} ❌</b>"
+    )
+
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(
+        text="🔄 Обновить",
+        callback_data=AdminPanelCallback(action="vless_monitor_check").pack(),
+    ))
+    kb.row(InlineKeyboardButton(
+        text="⬅️ Назад",
+        callback_data=AdminPanelCallback(action="admin").pack(),
+    ))
+
+    await callback.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="HTML")
